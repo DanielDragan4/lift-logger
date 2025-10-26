@@ -118,7 +118,7 @@ class User(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     auth0_id = db.Column(db.String(255), unique=True, nullable=False)
-    email = db.Column(db.String(255), unique=True, nullable=False)
+    email = db.Column(db.String(255), unique=False, nullable=True)
     name = db.Column(db.String(100))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_login = db.Column(db.DateTime, default=datetime.utcnow)
