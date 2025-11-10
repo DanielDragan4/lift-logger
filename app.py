@@ -14,6 +14,40 @@ from jwt import PyJWKClient
 from urllib.request import urlopen
 import json
 
+class ValidationError(Exception):
+    """Custom validation error"""
+    def __init__(self, message, status_code=400):
+        self.message = message
+        self.status_code = status_code
+
+def validate_required_fields(data, required_fields):
+    """Validate that all required fields are present"""
+    missing = [field for field in required_fields if field not in data or data[field] is None]
+    if missing:
+        raise ValidationError(f"Missing required fields: {', '.join(missing)}")
+
+def validate_positive_number(value, field_name):
+    """Validate that a number is positive"""
+    try:
+        num = float(value)
+        if num <= 0:
+            raise ValidationError(f"{field_name} must be positive")
+        return num
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field_name} must be a valid number")
+
+def validate_integer(value, field_name, min_val=None, max_val=None):
+    """Validate that a value is an integer within range"""
+    try:
+        num = int(value)
+        if min_val is not None and num < min_val:
+            raise ValidationError(f"{field_name} must be at least {min_val}")
+        if max_val is not None and num > max_val:
+            raise ValidationError(f"{field_name} must be at most {max_val}")
+        return num
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field_name} must be a valid integer")
+
 app = Flask(__name__)
 CORS(app)
 
@@ -89,25 +123,35 @@ def requires_auth(f):
         # Get or create user
         auth0_id = payload.get('sub')
         user = User.query.filter_by(auth0_id=auth0_id).first()
-        
-        if not user:
-            # Create user on first login
-            email = payload.get('email', '')
-            name = payload.get('name', email.split('@')[0] if email else 'User')
-            user = User(
-                auth0_id=auth0_id,
-                email=email,
-                name=name
-            )
-            db.session.add(user)
-            db.session.commit()
-        else:
-            # Update last login
-            user.last_login = datetime.utcnow()
-            db.session.commit()
-        
-        # Pass user to the route
-        return f(user, *args, **kwargs)
+        try:  
+            if not user:
+                # Create user on first login
+                email = (payload.get('email') or 
+                        payload.get(f'{AUTH0_DOMAIN}/email') or 
+                        payload.get('nickname', auth0_id) + '@noemail.com'
+                        )
+                name = (payload.get('name') or 
+                        payload.get('nickname') or 
+                        email.split('@')[0]
+                        )
+                user = User(
+                    auth0_id=auth0_id,
+                    email=email,
+                    name=name
+                )
+                db.session.add(user)
+                db.session.commit()
+            else:
+                # Update last login
+                user.last_login = datetime.utcnow()
+                db.session.commit()
+                
+            # Pass user to the route
+            return f(user, *args, **kwargs)
+        except Exception as e:
+            db.session.rollback()
+            print(f"Database error in auth: {str(e)}")
+            return jsonify({'error': 'Database error during authentication'}), 500
     
     return decorated
 
@@ -262,6 +306,19 @@ def start_workout(user):
     """Start a new workout"""
     data = request.json
     
+    try:
+        validate_required_fields(data, ['workout_type'])
+        workout_type = validate_integer(data['workout_type'], 'workout_type', 1, 6)
+        
+        #validate date if provided
+        if 'date' in data and data['date']:
+            date = validate_date(data['date']) 
+        else: 
+            date = datetime.utcnow().date()
+            
+    except ValidationError as e:
+        return jsonify({'error': e.message}), e.status_code
+    
     workout = Workout(
         user_id=user.id,
         date=datetime.strptime(data.get('date', datetime.utcnow().date().isoformat()), '%Y-%m-%d').date(),
@@ -269,10 +326,13 @@ def start_workout(user):
         notes=data.get('notes', '')
     )
     
-    db.session.add(workout)
-    db.session.commit()
-    
-    return jsonify(workout.to_dict()), 201
+    try: 
+        db.session.add(workout)
+        db.session.commit()
+        return jsonify(workout.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to create workout'}), 500
 
 
 @app.route('/api/workouts/<int:workout_id>/end', methods=['PUT'])
@@ -362,8 +422,33 @@ def log_set(user):
     """Log a new set"""
     data = request.json
     
+    try:
+        validate_required_fields(data, ['workout_id', 'exercise_id', 'weight', 'reps'])
+        
+        weight = validate_positive_number(data['weight'], 'weight')
+        reps = validate_integer(data['reps'], 'reps', 1)
+        set_number = validate_integer(data['set_number'], 'set_number', 1)
+        
+        if 'feel_rating' in data and data['feel_rating'] is not None:
+            feel_rating = validate_integer(data['feel_rating'], 'feel_rating', 1, 10)
+        else:
+            feel_rating = None
+        
+        if 'rpe' in data and data['rpe']:
+            rpe = validate_integer(data['rpe'], 'rpe', 1, 10)
+            if rpe > 10:
+                raise ValidationError('rpe must be between 0 and 10')
+        else:
+            rpe = None
+            
+    except ValidationError as e:
+        return jsonify({'error': e.message}), e.status_code
+            
+    
     # Verify workout belongs to user
     workout = Workout.query.filter_by(id=data['workout_id'], user_id=user.id).first_or_404()
+    if not workout:
+        return jsonify({'error': 'Workout not found'}), 404
     
     workout_set = WorkoutSet(
         workout_id=data['workout_id'],
@@ -380,10 +465,13 @@ def log_set(user):
         notes=data.get('notes', '')
     )
     
-    db.session.add(workout_set)
-    db.session.commit()
-    
-    return jsonify(workout_set.to_dict()), 201
+    try:
+        db.session.add(workout_set)
+        db.session.commit()   
+        return jsonify(workout_set.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to log set'}), 500
 
 
 @app.route('/api/sets/<int:set_id>', methods=['PUT'])
@@ -582,6 +670,9 @@ def reset_db():
 
 
 # ===== ERROR HANDLERS =====
+@app.errorhandler(ValidationError)
+def handle_validation_error(error):
+    return jsonify({'error': error.message}), error.status_code
 
 @app.errorhandler(404)
 def not_found(error):
